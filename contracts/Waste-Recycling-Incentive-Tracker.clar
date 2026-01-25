@@ -8,6 +8,10 @@
 (define-constant err-invalid-amount (err u104))
 (define-constant err-unauthorized (err u105))
 (define-constant err-invalid-waste-type (err u106))
+(define-constant err-streak-already-claimed (err u107))
+
+(define-constant streak-window u144)
+(define-constant streak-bonus-rate u5)
 
 (define-data-var total-recycled uint u0)
 (define-data-var reward-rate uint u10)
@@ -49,6 +53,16 @@
 (define-map verifiers
   { verifier: principal }
   { authorized: bool }
+)
+
+(define-map user-streaks
+  { user: principal }
+  {
+    current-streak: uint,
+    last-activity-block: uint,
+    longest-streak: uint,
+    total-bonus-earned: uint
+  }
 )
 
 (define-public (initialize-contract)
@@ -111,6 +125,7 @@
       (merge user-profile { total-submissions: (+ (get total-submissions user-profile) u1) })
     )
     (var-set next-submission-id (+ submission-id u1))
+    (update-user-streak user)
     (ok submission-id)
   )
 )
@@ -255,4 +270,92 @@
 
 (define-read-only (get-total-supply)
   (ft-get-supply waste-token)
+)
+
+(define-read-only (get-user-streak (user principal))
+  (map-get? user-streaks { user: user })
+)
+
+(define-read-only (calculate-streak-bonus (streak-count uint))
+  (* streak-count streak-bonus-rate)
+)
+
+(define-private (update-user-streak (user principal))
+  (let
+    (
+      (current-block stacks-block-height)
+      (existing-streak (map-get? user-streaks { user: user }))
+    )
+    (match existing-streak
+      streak-data
+      (let
+        (
+          (last-block (get last-activity-block streak-data))
+          (blocks-since-last (- current-block last-block))
+          (is-within-window (<= blocks-since-last streak-window))
+          (new-streak (if is-within-window
+                        (+ (get current-streak streak-data) u1)
+                        u1))
+          (new-longest (if (> new-streak (get longest-streak streak-data))
+                         new-streak
+                         (get longest-streak streak-data)))
+        )
+        (map-set user-streaks
+          { user: user }
+          {
+            current-streak: new-streak,
+            last-activity-block: current-block,
+            longest-streak: new-longest,
+            total-bonus-earned: (get total-bonus-earned streak-data)
+          }
+        )
+        new-streak
+      )
+      (begin
+        (map-set user-streaks
+          { user: user }
+          {
+            current-streak: u1,
+            last-activity-block: current-block,
+            longest-streak: u1,
+            total-bonus-earned: u0
+          }
+        )
+        u1
+      )
+    )
+  )
+)
+
+(define-public (claim-streak-bonus)
+  (let
+    (
+      (user tx-sender)
+      (user-profile (unwrap! (map-get? user-profiles { user: user }) err-not-found))
+      (streak-data (unwrap! (map-get? user-streaks { user: user }) err-not-found))
+      (current-streak (get current-streak streak-data))
+      (bonus-amount (calculate-streak-bonus current-streak))
+      (current-balance (default-to u0 (get balance (map-get? user-balances { user: user }))))
+    )
+    (asserts! (>= current-streak u3) err-invalid-amount)
+    (try! (ft-mint? waste-token bonus-amount user))
+    (map-set user-streaks
+      { user: user }
+      (merge streak-data {
+        current-streak: u0,
+        total-bonus-earned: (+ (get total-bonus-earned streak-data) bonus-amount)
+      })
+    )
+    (map-set user-balances
+      { user: user }
+      { balance: (+ current-balance bonus-amount) }
+    )
+    (map-set user-profiles
+      { user: user }
+      (merge user-profile {
+        total-tokens-earned: (+ (get total-tokens-earned user-profile) bonus-amount)
+      })
+    )
+    (ok bonus-amount)
+  )
 )
